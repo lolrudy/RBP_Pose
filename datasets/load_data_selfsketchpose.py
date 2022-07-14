@@ -1,0 +1,630 @@
+import os
+import cv2
+import math
+import random
+
+import mmcv
+import numpy as np
+import _pickle as cPickle
+from config.config import *
+from datasets.data_augmentation import defor_2D, get_rotation
+FLAGS = flags.FLAGS
+
+import torch
+from PIL import Image
+import torch.utils.data as data
+import torchvision.transforms as transforms
+from tools.eval_utils import load_depth, get_bbox
+from tools.dataset_utils import *
+
+
+class SketchPoseDataset(data.Dataset):
+    def __init__(self, source=None, mode='train', data_dir=None,
+                 n_pts=1024, img_size=256, per_obj=''):
+        '''
+
+        :param source: 'CAMERA' or 'Real' or 'CAMERA+Real'
+        :param mode: 'train' or 'test'
+        :param data_dir: 'path to dataset'
+        :param n_pts: 'number of selected sketch point', no use here
+        :param img_size: cropped image size
+        '''
+        self.source = source
+        self.mode = mode
+        self.data_dir = data_dir
+        self.n_pts = n_pts
+        self.img_size = img_size
+
+        assert source in ['CAMERA', 'Real', 'CAMERA+Real']
+        assert mode in ['train', 'test']
+        img_list_path = ['CAMERA/train_list.txt', 'Real/train_list.txt',
+                         'CAMERA/val_list.txt', 'Real/test_list.txt']
+        model_file_path = ['obj_models/camera_train.pkl', 'obj_models/real_train.pkl',
+                           'obj_models/camera_val.pkl', 'obj_models/real_test.pkl']
+        # occupancy_resolution = 16
+        # self.resolution = occupancy_resolution
+        # model_occupancy_file_path = [f'obj_models/camera_train_occupancy_res{occupancy_resolution}.pkl',
+        #                              f'obj_models/real_train_occupancy_res{occupancy_resolution}.pkl',
+        #                              f'obj_models/camera_val_occupancy_res{occupancy_resolution}.pkl',
+        #                              f'obj_models/real_test_occupancy_res{occupancy_resolution}.pkl']
+
+        if mode == 'train':
+            del img_list_path[2:]
+            del model_file_path[2:]
+            # del model_occupancy_file_path[2:]
+        else:
+            del img_list_path[:2]
+            del model_file_path[:2]
+            # del model_occupancy_file_path[:2]
+        if source == 'CAMERA':
+            del img_list_path[-1]
+            del model_file_path[-1]
+            # del model_occupancy_file_path[-1]
+        elif source == 'Real':
+            del img_list_path[0]
+            del model_file_path[0]
+            # del model_occupancy_file_path[0]
+        else:
+            # only use Real to test when source is CAMERA+Real
+            if mode == 'test':
+                del img_list_path[0]
+                del model_file_path[0]
+                # del model_occupancy_file_path[0]
+
+        img_list = []
+        subset_len = []
+        #  aggregate all availabel datasets
+        for path in img_list_path:
+            img_list += [os.path.join(path.split('/')[0], line.rstrip('\n'))
+                         for line in open(os.path.join(data_dir, path))]
+            subset_len.append(len(img_list))
+        if len(subset_len) == 2:
+            self.subset_len = [subset_len[0], subset_len[1] - subset_len[0]]
+        self.cat_names = ['bottle', 'bowl', 'camera', 'can', 'laptop', 'mug']
+        self.cat_name2id = {'bottle': 1, 'bowl': 2, 'camera': 3, 'can': 4, 'laptop': 5, 'mug': 6}
+        self.id2cat_name = {'1': 'bottle', '2': 'bowl', '3': 'camera', '4': 'can', '5': 'laptop', '6': 'mug'}
+        self.id2cat_name_CAMERA = {'1': '02876657',
+                                   '2': '02880940',
+                                   '3': '02942699',
+                                   '4': '02946921',
+                                   '5': '03642806',
+                                   '6': '03797390'}
+        if source == 'CAMERA':
+            self.id2cat_name = self.id2cat_name_CAMERA
+        self.per_obj = per_obj
+        self.per_obj_id = None
+        # only train one object
+        if self.per_obj in self.cat_names:
+            self.per_obj_id = self.cat_name2id[self.per_obj]
+            img_list_cache_dir = os.path.join(self.data_dir, 'img_list')
+            if not os.path.exists(img_list_cache_dir):
+                os.makedirs(img_list_cache_dir)
+            img_list_cache_filename = os.path.join(img_list_cache_dir, f'{per_obj}_{source}_{mode}_img_list.txt')
+            if os.path.exists(img_list_cache_filename):
+                print(f'read image list cache from {img_list_cache_filename}')
+                img_list_obj = [line.rstrip('\n') for line in open(os.path.join(data_dir, img_list_cache_filename))]
+            else:
+                # needs to reorganize img_list
+                s_obj_id = self.cat_name2id[self.per_obj]
+                img_list_obj = []
+                from tqdm import tqdm
+                for i in tqdm(range(len(img_list))):
+                    gt_path = os.path.join(self.data_dir, img_list[i] + '_label.pkl')
+                    try:
+                        with open(gt_path, 'rb') as f:
+                            gts = cPickle.load(f)
+                        id_list = gts['class_ids']
+                        if s_obj_id in id_list:
+                            img_list_obj.append(img_list[i])
+                    except:
+                        print(f'WARNING {gt_path} is empty')
+                        continue
+                with open(img_list_cache_filename, 'w') as f:
+                    for img_path in img_list_obj:
+                        f.write("%s\n" % img_path)
+                print(f'save image list cache to {img_list_cache_filename}')
+                # iter over  all img_list, cal sublen
+
+            if len(subset_len) == 2:
+                camera_len  = 0
+                real_len = 0
+                for i in range(len(img_list_obj)):
+                    if 'CAMERA' in img_list_obj[i].split('/'):
+                        camera_len += 1
+                    else:
+                        real_len += 1
+                self.subset_len = [camera_len, real_len]
+            #  if use only one dataset
+            #  directly load all data
+            img_list = img_list_obj
+
+        self.img_list = img_list
+        self.length = len(self.img_list)
+
+        models = {}
+        for path in model_file_path:
+            with open(os.path.join(data_dir, path), 'rb') as f:
+                models.update(cPickle.load(f))
+        self.models = models
+
+        # models_occupancy = {}
+        # for path in model_occupancy_file_path:
+        #     with open(os.path.join(data_dir, path), 'rb') as f:
+        #         models_occupancy.update(cPickle.load(f))
+        # self.models_occupancy = models_occupancy
+
+        # move the center to the body of the mug
+        # meta info for re-label mug category
+        with open(os.path.join(data_dir, 'obj_models/mug_meta.pkl'), 'rb') as f:
+            self.mug_meta = cPickle.load(f)
+
+        self.camera_intrinsics = np.array([[577.5, 0, 319.5], [0, 577.5, 239.5], [0, 0, 1]],
+                                          dtype=np.float)  # [fx, fy, cx, cy]
+        self.real_intrinsics = np.array([[591.0125, 0, 322.525], [0, 590.16775, 244.11084], [0, 0, 1]], dtype=np.float)
+
+        self.color_aug_prob = FLAGS.color_aug_prob
+        self.color_aug_type = FLAGS.color_aug_type
+        self.color_aug_code = FLAGS.color_aug_code
+        if mode == "train" and self.color_aug_prob > 0:
+            self.color_augmentor = self._get_color_augmentor(aug_type=self.color_aug_type, aug_code=self.color_aug_code)
+        else:
+            self.color_augmentor = None
+
+        invalid_list_cache_path = os.path.join(self.data_dir, f'invalid_list_cache_dict_{source}_{per_obj}.txt')
+        self.invalid_list_cache_path = invalid_list_cache_path
+        self.invalid_dict = {}
+        if os.path.exists(invalid_list_cache_path):
+            with open(invalid_list_cache_path, 'r') as file:
+                while True:
+                    line = file.readline()
+                    if not line:
+                        break
+                    path, inst_id = line.split()
+                    inst_id = int(inst_id)
+                    if path in self.invalid_dict.keys():
+                        self.invalid_dict[path].append(inst_id)
+                    else:
+                        self.invalid_dict[path] = [inst_id]
+
+        self.mug_sym = mmcv.load(os.path.join(self.data_dir, 'Real/train/mug_handle.pkl'))
+        self.shape_prior = np.load(os.path.join(data_dir, 'results/mean_shape/mean_points_emb.npy'))
+
+        print('{} images found.'.format(self.length))
+        print('{} models loaded.'.format(len(self.models)))
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        #   load ground truth
+        #  if per_obj is specified, then we only select the target object
+        # index = index % self.length  # here something wrong
+        img_path = os.path.join(self.data_dir, self.img_list[index])
+        # if img_path in self.invalid_dict:
+        #     return self.__getitem__((index + 1) % self.__len__())
+        try:
+            with open(img_path + '_label.pkl', 'rb') as f:
+                gts = cPickle.load(f)
+        except:
+            return self.__getitem__((index + 1) % self.__len__())
+        if 'CAMERA' in img_path.split('/'):
+            out_camK = self.camera_intrinsics
+            img_type = 'syn'
+        else:
+            out_camK = self.real_intrinsics
+            img_type = 'real'
+
+        # select one foreground object,
+        # if specified, then select the object
+
+        if self.per_obj in self.cat_names:
+            idx_per_obj = []
+            for item in enumerate(gts['class_ids']):
+                if item[1] == self.per_obj_id:
+                    idx_per_obj.append(item[0])
+            idx = random.choice(idx_per_obj)
+            # idx = gts['class_ids'].index(self.per_obj_id)
+        else:
+            idx = random.randint(0, len(gts['instance_ids']) - 1)
+            if FLAGS.ban_mug:
+                while gts['class_ids'][idx]  == 6:
+                    idx = random.randint(0, len(gts['instance_ids']) - 1)
+        if img_path in self.invalid_dict.keys():
+            if gts['instance_ids'][idx] in self.invalid_dict[img_path]:
+                return self.__getitem__((index + 1) % self.__len__())
+        if gts['class_ids'][idx] == 6 and img_type == 'real':
+            assert not FLAGS.ban_mug
+            handle_tmp_path = img_path.split('/')
+            scene_label = handle_tmp_path[-2] + '_res'
+            img_id = int(handle_tmp_path[-1])
+            mug_handle = self.mug_sym[scene_label][img_id]
+        else:
+            mug_handle = 1
+
+        rgb = cv2.imread(img_path + '_color.png')
+        if rgb is not None:
+            rgb = rgb[:, :, :3]
+        else:
+            return self.__getitem__((index + 1) % self.__len__())
+
+        im_H, im_W = rgb.shape[0], rgb.shape[1]
+        if self.mode == "train" and self.color_aug_prob > 0 and self.color_augmentor is not None:
+            if np.random.rand() < self.color_aug_prob:
+                if FLAGS.COLOR_AUG_SYN_ONLY:
+                    if img_type == 'syn':
+                        rgb = self._color_aug(rgb, self.color_aug_type)
+                else:
+                    rgb = self._color_aug(rgb, self.color_aug_type)
+        coord_2d = get_2d_coord_np(im_W, im_H).transpose(1, 2, 0)
+
+        depth_path = img_path + '_depth.png'
+        if os.path.exists(depth_path):
+            depth = load_depth(depth_path)
+        else:
+            return self.__getitem__((index + 1) % self.__len__())
+
+        mask_path = img_path + '_mask.png'
+        mask = cv2.imread(mask_path)
+        if mask is not None:
+            mask = mask[:, :, 2]
+        else:
+            return self.__getitem__((index + 1) % self.__len__())
+
+        # cat_id, rotation translation and scale
+        cat_id = gts['class_ids'][idx] - 1  # convert to 0-indexed
+        # note that this is nocs model, normalized along diagonal axis
+        model_name = gts['model_list'][idx]
+
+        nocs_coord = cv2.imread(img_path + '_coord.png')
+        if nocs_coord is not None:
+            nocs_coord = nocs_coord[:, :, :3]
+        else:
+            return self.__getitem__((index + 1) % self.__len__())
+        nocs_coord = nocs_coord[:, :, (2, 1, 0)]
+        nocs_coord = np.array(nocs_coord, dtype=np.float32) / 255
+        nocs_coord[:, :, 2] = 1 - nocs_coord[:, :, 2]
+        # [0, 1] -> [-0.5, 0.5]
+        nocs_coord = nocs_coord - 0.5
+
+        # adjust nocs coords for mug category
+        if cat_id == 5:
+            T0 = self.mug_meta[model_name][0]
+            s0 = self.mug_meta[model_name][1]
+            nocs_coord = s0 * (nocs_coord + T0)
+
+        # aggragate information about the selected object
+        inst_id = gts['instance_ids'][idx]
+        rmin, rmax, cmin, cmax = get_bbox(gts['bboxes'][idx])
+        # here resize and crop to a fixed size 256 x 256
+        bbox_xyxy = np.array([cmin, rmin, cmax, rmax])
+        bbox_center, scale = aug_bbox_DZI(FLAGS, bbox_xyxy, im_H, im_W)
+        bw = max(bbox_xyxy[2] - bbox_xyxy[0], 1)
+        bh = max(bbox_xyxy[3] - bbox_xyxy[1], 1)
+        ## roi_image ------------------------------------
+        roi_img = crop_resize_by_warp_affine(
+            rgb, bbox_center, scale, FLAGS.img_size, interpolation=cv2.INTER_NEAREST
+        ).transpose(2, 0, 1)
+        # roi_coord_2d ----------------------------------------------------
+        roi_coord_2d = crop_resize_by_warp_affine(
+            coord_2d, bbox_center, scale, FLAGS.img_size, interpolation=cv2.INTER_NEAREST
+        ).transpose(2, 0, 1)
+
+
+        mask_target = mask.copy().astype(np.float)
+        mask_target[mask != inst_id] = 0.0
+        mask_target[mask == inst_id] = 1.0
+        nocs_coord[mask_target==0] = 0
+
+        # depth[mask_target == 0.0] = 0.0
+        roi_mask = crop_resize_by_warp_affine(
+            mask_target, bbox_center, scale, FLAGS.img_size, interpolation=cv2.INTER_NEAREST
+        )
+        roi_mask = np.expand_dims(roi_mask, axis=0)
+        roi_depth = crop_resize_by_warp_affine(
+            depth, bbox_center, scale, FLAGS.img_size, interpolation=cv2.INTER_NEAREST
+        )
+        roi_nocs_coord = crop_resize_by_warp_affine(
+            nocs_coord, bbox_center, scale, FLAGS.img_size, interpolation=cv2.INTER_NEAREST
+        ).transpose(2, 0, 1)
+
+        roi_depth = np.expand_dims(roi_depth, axis=0)
+        # normalize depth
+        depth_valid = roi_depth > 0
+        if np.sum(depth_valid) <= 1.0:
+            return self.__getitem__((index + 1) % self.__len__())
+        roi_m_d_valid = roi_mask.astype(np.bool) * depth_valid
+        if np.sum(roi_m_d_valid) <= 1.0:
+            return self.__getitem__((index + 1) % self.__len__())
+
+        depth_v_value = roi_depth[roi_m_d_valid]
+        depth_normalize = (roi_depth - np.min(depth_v_value)) / (np.max(depth_v_value) - np.min(depth_v_value) + 1e-10)
+        depth_normalize[~roi_m_d_valid] = 0.0
+        model = self.models[model_name].astype(np.float32)  # 1024 points
+        nocs_scale = gts['scales'][idx]  # model bounding box diagonal length !!
+        # NOTE: gt of train dataset is the original annotation, which has no refinement on mug !!
+        rotation = gts['rotations'][idx]
+        translation = gts['translations'][idx]
+        if cat_id == 5:
+            translation = translation - nocs_scale * rotation @ T0
+            nocs_scale = nocs_scale / s0
+        # fsnet scale (from model) scale residual
+        fsnet_scale_delta, mean_shape = self.get_fs_net_scale(self.id2cat_name[str(cat_id + 1)], model, nocs_scale)
+        fsnet_scale_delta = fsnet_scale_delta / 1000.0
+        mean_shape = mean_shape / 1000.0
+
+        # some data need generation
+        ######################
+        ######################
+        # dense depth map
+        dense_depth = depth_normalize
+        # occupancy canonical
+        # sym
+        sym_info = self.get_sym_info(self.id2cat_name[str(cat_id + 1)], mug_handle=mug_handle)
+        # add nnoise to roi_mask
+        roi_mask_def = defor_2D(roi_mask, rand_r=FLAGS.roi_mask_r, rand_pro=FLAGS.roi_mask_pro)
+
+        # generate augmentation parameters
+        bb_aug, rt_aug_t, rt_aug_R = self.generate_aug_parameters()
+
+        shape_prior = self.shape_prior[cat_id]
+
+        data_dict = {}
+        data_dict['roi_img'] = torch.as_tensor(roi_img.astype(np.float32)).contiguous()
+        data_dict['roi_depth'] = torch.as_tensor(roi_depth.astype(np.float32)).contiguous()
+        data_dict['dense_depth'] = torch.as_tensor(dense_depth.astype(np.float32)).contiguous()
+        data_dict['depth_normalize'] = torch.as_tensor(depth_normalize.astype(np.float32)).contiguous()
+        data_dict['cam_K'] = torch.as_tensor(out_camK.astype(np.float32)).contiguous()
+        data_dict['roi_mask'] = torch.as_tensor(roi_mask.astype(np.float32)).contiguous()
+        data_dict['cat_id_0_base'] = torch.as_tensor(cat_id, dtype=torch.float32).contiguous()
+        data_dict['rotation'] = torch.as_tensor(rotation, dtype=torch.float32).contiguous()
+        data_dict['translation'] = torch.as_tensor(translation, dtype=torch.float32).contiguous()
+        data_dict['fsnet_scale_delta'] = torch.as_tensor(fsnet_scale_delta, dtype=torch.float32).contiguous()
+        data_dict['sym_info'] = torch.as_tensor(sym_info.astype(np.float32)).contiguous()
+        data_dict['roi_coord_2d'] = torch.as_tensor(roi_coord_2d, dtype=torch.float32).contiguous()
+        data_dict['mean_shape'] = torch.as_tensor(mean_shape, dtype=torch.float32).contiguous()
+        data_dict['aug_bb'] = torch.as_tensor(bb_aug, dtype=torch.float32).contiguous()
+        data_dict['aug_rt_t'] = torch.as_tensor(rt_aug_t, dtype=torch.float32).contiguous()
+        data_dict['aug_rt_R'] = torch.as_tensor(rt_aug_R, dtype=torch.float32).contiguous()
+        data_dict['roi_mask_deform'] = torch.as_tensor(roi_mask_def, dtype=torch.float32).contiguous()
+        data_dict['model_point'] = torch.as_tensor(model, dtype=torch.float32).contiguous()
+        data_dict['nocs_scale'] = torch.as_tensor(nocs_scale, dtype=torch.float32).contiguous()
+        data_dict['shape_prior'] = torch.as_tensor(shape_prior, dtype=torch.float32).contiguous()
+        data_dict['nocs_coord'] = torch.as_tensor(roi_nocs_coord, dtype=torch.float32).contiguous()
+        data_dict['img_path'] = img_path
+        data_dict['inst_id'] = inst_id
+        return data_dict
+
+
+    def generate_aug_parameters(self, s_x=(0.8, 1.2), s_y=(0.8, 1.2), s_z=(0.8, 1.2), ax=50, ay=50, az=50, a=15):
+        # for bb aug
+        ex, ey, ez = np.random.rand(3)
+        ex = ex * (s_x[1] - s_x[0]) + s_x[0]
+        ey = ey * (s_y[1] - s_y[0]) + s_y[0]
+        ez = ez * (s_z[1] - s_z[0]) + s_z[0]
+        # for R, t aug
+        Rm = get_rotation(np.random.uniform(-a, a), np.random.uniform(-a, a), np.random.uniform(-a, a))
+        dx = np.random.rand() * 2 * ax - ax
+        dy = np.random.rand() * 2 * ay - ay
+        dz = np.random.rand() * 2 * az - az
+        return np.array([ex, ey, ez], dtype=np.float32), np.array([dx, dy, dz], dtype=np.float32) / 1000.0, Rm
+
+
+    def get_fs_net_scale(self, c, model, nocs_scale):
+        # model pc x 3
+        lx = 2 * max(max(model[:, 0]), -min(model[:, 0]))
+        ly = max(model[:, 1]) - min(model[:, 1])
+        lz = max(model[:, 2]) - min(model[:, 2])
+
+        # real scale
+        lx_t = lx * nocs_scale * 1000
+        ly_t = ly * nocs_scale * 1000
+        lz_t = lz * nocs_scale * 1000
+
+        if c == 'bottle':
+            unitx = 87
+            unity = 220
+            unitz = 89
+        elif c == 'bowl':
+            unitx = 165
+            unity = 80
+            unitz = 165
+        elif c == 'camera':
+            unitx = 88
+            unity = 128
+            unitz = 156
+        elif c == 'can':
+            unitx = 68
+            unity = 146
+            unitz = 72
+        elif c == 'laptop':
+            unitx = 346
+            unity = 200
+            unitz = 335
+        elif c == 'mug':
+            unitx = 146
+            unity = 83
+            unitz = 114
+        elif c == '02876657':
+            unitx = 324 / 4
+            unity = 874 / 4
+            unitz = 321 / 4
+        elif c == '02880940':
+            unitx = 675 / 4
+            unity = 271 / 4
+            unitz = 675 / 4
+        elif c == '02942699':
+            unitx = 464 / 4
+            unity = 487 / 4
+            unitz = 702 / 4
+        elif c == '02946921':
+            unitx = 450 / 4
+            unity = 753 / 4
+            unitz = 460 / 4
+        elif c == '03642806':
+            unitx = 581 / 4
+            unity = 445 / 4
+            unitz = 672 / 4
+        elif c == '03797390':
+            unitx = 670 / 4
+            unity = 540 / 4
+            unitz = 497 / 4
+        else:
+            unitx = 0
+            unity = 0
+            unitz = 0
+            print('This category is not recorded in my little brain.')
+            raise NotImplementedError
+        # scale residual
+        return np.array([lx_t - unitx, ly_t - unity, lz_t - unitz]), np.array([unitx, unity, unitz])
+
+    def get_sym_info(self, c, mug_handle=1):
+        #  sym_info  c0 : face classfication  c1, c2, c3:Three view symmetry, correspond to xy, xz, yz respectively
+        # c0: 0 no symmetry 1 axis symmetry 2 two reflection planes 3 unimplemented type
+        #  Y axis points upwards, x axis pass through the handle, z axis otherwise
+        #
+        # for specific defination, see sketch_loss
+        if c == 'bottle':
+            sym = np.array([1, 1, 0, 1], dtype=np.int)
+        elif c == 'bowl':
+            sym = np.array([1, 1, 0, 1], dtype=np.int)
+        elif c == 'camera':
+            sym = np.array([0, 0, 0, 0], dtype=np.int)
+        elif c == 'can':
+            sym = np.array([1, 1, 1, 1], dtype=np.int)
+        elif c == 'laptop':
+            sym = np.array([0, 1, 0, 0], dtype=np.int)
+        elif c == 'mug' and mug_handle == 1:
+            sym = np.array([0, 1, 0, 0], dtype=np.int)  # for mug, we currently mark it as no symmetry
+        elif c == 'mug' and mug_handle == 0:
+            sym = np.array([1, 0, 0, 0], dtype=np.int)
+        else:
+            sym = np.array([0, 0, 0, 0], dtype=np.int)
+        return sym
+
+    def _get_color_augmentor(self, aug_type="aae", aug_code=None):
+        # fmt: off
+        if aug_type.lower() == "aae":
+            import imgaug.augmenters as iaa  # noqa
+            from imgaug.augmenters import (Sequential, SomeOf, OneOf, Sometimes, WithColorspace, WithChannels, Noop,
+                                           Lambda, AssertLambda, AssertShape, Scale, CropAndPad, Pad, Crop, Fliplr,
+                                           Flipud, Superpixels, ChangeColorspace, PerspectiveTransform, Grayscale,
+                                           GaussianBlur, AverageBlur, MedianBlur, Convolve, Sharpen, Emboss, EdgeDetect,
+                                           DirectedEdgeDetect, Add, AddElementwise, AdditiveGaussianNoise, Multiply,
+                                           MultiplyElementwise, Dropout, CoarseDropout, Invert, ContrastNormalization,
+                                           Affine, PiecewiseAffine, ElasticTransformation, pillike,
+                                           LinearContrast)  # noqa
+            aug_code = """Sequential([
+                # Sometimes(0.5, PerspectiveTransform(0.05)),
+                # Sometimes(0.5, CropAndPad(percent=(-0.05, 0.1))),
+                # Sometimes(0.5, Affine(scale=(1.0, 1.2))),
+                Sometimes(0.5, CoarseDropout( p=0.2, size_percent=0.05) ),
+                Sometimes(0.5, GaussianBlur(1.2*np.random.rand())),
+                Sometimes(0.5, Add((-25, 25), per_channel=0.3)),
+                Sometimes(0.3, Invert(0.2, per_channel=True)),
+                Sometimes(0.5, Multiply((0.6, 1.4), per_channel=0.5)),
+                Sometimes(0.5, Multiply((0.6, 1.4))),
+                Sometimes(0.5, LinearContrast((0.5, 2.2), per_channel=0.3))
+                ], random_order = False)"""
+            color_augmentor = eval(aug_code)
+        elif aug_type.lower() == 'cosy+aae':
+            import imgaug.augmenters as iaa
+            from imgaug.augmenters import (Sequential, SomeOf, OneOf, Sometimes, WithColorspace, WithChannels, Noop,
+                                           Lambda, AssertLambda, AssertShape, Scale, CropAndPad, Pad, Crop, Fliplr,
+                                           Flipud, Superpixels, ChangeColorspace, PerspectiveTransform, Grayscale,
+                                           GaussianBlur, AverageBlur, MedianBlur, Convolve, Sharpen, Emboss, EdgeDetect,
+                                           DirectedEdgeDetect, Add, AddElementwise, AdditiveGaussianNoise, Multiply,
+                                           MultiplyElementwise, Dropout, CoarseDropout, Invert, ContrastNormalization,
+                                           Affine, PiecewiseAffine, ElasticTransformation, pillike,
+                                           LinearContrast)  # noqa
+            aug_code = """Sequential([
+            Sometimes(0.5, CoarseDropout( p=0.2, size_percent=0.05) ),
+            Sometimes(0.4, GaussianBlur((0., 3.))),
+            Sometimes(0.3, pillike.EnhanceSharpness(factor=(0., 50.))),
+            Sometimes(0.3, pillike.EnhanceContrast(factor=(0.2, 50.))),
+            Sometimes(0.5, pillike.EnhanceBrightness(factor=(0.1, 6.))),
+            Sometimes(0.3, pillike.EnhanceColor(factor=(0., 20.))),
+            Sometimes(0.5, Add((-25, 25), per_channel=0.3)),
+            Sometimes(0.3, Invert(0.2, per_channel=True)),
+            Sometimes(0.5, Multiply((0.6, 1.4), per_channel=0.5)),
+            Sometimes(0.5, Multiply((0.6, 1.4))),
+            Sometimes(0.1, AdditiveGaussianNoise(scale=10, per_channel=True)),
+            Sometimes(0.5, iaa.contrast.LinearContrast((0.5, 2.2), per_channel=0.3)),
+            Sometimes(0.5, Grayscale(alpha=(0.0, 1.0))),
+            ], random_order=True)"""
+            color_augmentor = eval(aug_code)
+        elif aug_type.lower() == "code":  # assume imgaug
+            import imgaug.augmenters as iaa
+            from imgaug.augmenters import (Sequential, SomeOf, OneOf, Sometimes, WithColorspace, WithChannels, Noop,
+                                           Lambda, AssertLambda, AssertShape, Scale, CropAndPad, Pad, Crop, Fliplr,
+                                           Flipud, Superpixels, ChangeColorspace, PerspectiveTransform, Grayscale,
+                                           GaussianBlur, AverageBlur, MedianBlur, Convolve, Sharpen, Emboss, EdgeDetect,
+                                           DirectedEdgeDetect, Add, AddElementwise, AdditiveGaussianNoise, Multiply,
+                                           MultiplyElementwise, Dropout, CoarseDropout, Invert, ContrastNormalization,
+                                           Affine, PiecewiseAffine, ElasticTransformation, pillike,
+                                           LinearContrast)  # noqa
+            color_augmentor = eval(aug_code)
+        elif aug_type.lower() == 'code_albu':
+            from albumentations import (HorizontalFlip, IAAPerspective, ShiftScaleRotate, CLAHE, RandomRotate90,
+                                        Transpose, ShiftScaleRotate, Blur, OpticalDistortion, GridDistortion,
+                                        HueSaturationValue, IAAAdditiveGaussianNoise, GaussNoise, MotionBlur,
+                                        MedianBlur, IAAPiecewiseAffine, IAASharpen, IAAEmboss, RandomContrast,
+                                        RandomBrightness, Flip, OneOf, Compose, CoarseDropout, RGBShift, RandomGamma,
+                                        RandomBrightnessContrast, JpegCompression, InvertImg)  # noqa
+            color_augmentor = eval(aug_code)
+        else:
+            color_augmentor = None
+        # fmt: on
+        return color_augmentor
+
+    def _color_aug(self, image, aug_type="code"):
+        # assume image in [0, 255] uint8
+        if aug_type.lower() in ["aae", "code", "cosy+aae"]:
+            # imgaug need uint8
+            return self.color_augmentor.augment_image(image)
+        elif aug_type.lower() in ["code_albu"]:
+            augmented = self.color_augmentor(image=image)
+            return augmented["image"]
+        else:
+            raise ValueError("aug_type: {} is not supported.".format(aug_type))
+
+    def add_invalid_path(self, invalid_path_dict):
+        for path in invalid_path_dict.keys():
+            if path in self.invalid_dict.keys():
+                self.invalid_dict[path].append(invalid_path_dict[path])
+            else:
+                self.invalid_dict[path] = [invalid_path_dict[path]]
+        with open(self.invalid_list_cache_path, 'a') as file:
+            for path in invalid_path_dict:
+                file.write(path + ' ' + str(invalid_path_dict[path]) + '\n')
+
+
+if __name__ == '__main__':
+    def main(argv):
+        dataset = SketchPoseDataset(source='CAMERA', data_dir='/data2/zrd/datasets/NOCS')
+        for i in range(10):
+            data = dataset[i]
+            device = 'cpu'
+            img, s_d_map, d_d_map = data[0].to(device).numpy(), data[1].to(device), data[2].to(device)
+            s_d_map_n, camK = data[3].to(device), data[4].to(device)
+            obj_mask, obj_id = data[5].to(device), data[6].to(device)
+            R, T, s = data[7].to(device), data[8].to(device), data[9].to(device)
+            occupancy, sym = data[10].to(device), data[11].to(device)
+            grid, sketch = data[12].to(device).numpy(), data[13].to(device).numpy()
+            grid = grid.transpose(1, 2, 0) * 16
+            sketch[sketch != 0] = 200
+            img = img.transpose(1, 2, 0)
+            fuse = img.copy()
+            sketch = sketch.transpose(1, 2, 0)
+            zeros = np.zeros_like(sketch)
+            sketch_stack = np.concatenate([sketch, zeros, zeros], axis=-1)
+            grid = np.concatenate([grid, zeros], axis=-1)
+            fuse[sketch_stack > 0] = sketch_stack[sketch_stack > 0]
+            cv2.imwrite(f'/data2/zrd/debug/sketch_camera_points_{i}.png', sketch)
+            cv2.imwrite(f'/data2/zrd/debug/img_camera_points_{i}.png', img)
+            cv2.imwrite(f'/data2/zrd/debug/fuse_camera_points_{i}.png', fuse)
+            cv2.imwrite(f'/data2/zrd/debug/grid_camera_points_{i}.png', grid)
+
+
+    from absl import app
+
+    app.run(main)
