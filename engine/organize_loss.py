@@ -22,7 +22,7 @@ def control_loss(Train_stage):
     elif Train_stage == 'prior+recon+novote':
         name_mask_list = []
         name_fs_list = ['Rot1', 'Rot2', 'Rot1_cos', 'Rot2_cos', 'Rot_regular', 'Tran', 'Size', 'R_con']
-        name_recon_list = ['Per_point', 'Consistency']
+        name_recon_list = ['Per_point', ]
         name_prop_list = ['Prop_pm', 'Prop_sym', 'Prop_point_cano']
     elif Train_stage == 'FSNet_only':
         name_mask_list = []

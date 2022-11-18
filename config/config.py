@@ -7,7 +7,7 @@ flags.DEFINE_string("semantic_encoder_name", 'psp_net', 'select a backbone')
 # datasets
 flags.DEFINE_integer('obj_c', 6, 'number of categories')
 flags.DEFINE_string('dataset', 'Real', 'CAMERA or CAMERA+Real')
-flags.DEFINE_string('dataset_dir', '/data/zrd/datasets/NOCS', 'path to the dataset')
+flags.DEFINE_string('dataset_dir', '', 'path to the dataset')
 flags.DEFINE_string('per_obj', '', 'only train an specified object')
 flags.DEFINE_integer('ban_mug', 0, 'not include mug if true')
 flags.DEFINE_float('DZI_PAD_SCALE', 1.5, '')
