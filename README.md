@@ -25,7 +25,7 @@ Download the detection results in this [git](https://github.com/Gorilla-Lab-SCUT
 
 
 ## Trained model
-Trained model will be uploaded soon.
+Trained model is available [here](https://drive.google.com/file/d/1JrCyq1JK4vAIRNaACT2KTCZ62PptgF6I/view?usp=sharing).
 
 ## Training
 Please note, some details are changed from the original paper for more efficient training. 
