@@ -21,11 +21,11 @@ Pytorch implementation of RBP-Pose: Residual Bounding Box Projection for Categor
 
 ## Data Preparation
 To generate your own dataset, use the data preprocess code provided in this [git](https://github.com/mentian/object-deformnet/blob/master/preprocess/pose_data.py).
-Download the detection results in this [git](https://github.com/Gorilla-Lab-SCUT/DualPoseNet).
+Download the detection results in this [link](https://drive.google.com/drive/folders/1q8pjmHDfSUTna13F2R_gU3P-FYCjEP7A?usp=sharing).
 
 
 ## Trained model
-Trained model is available [here](https://drive.google.com/file/d/1JrCyq1JK4vAIRNaACT2KTCZ62PptgF6I/view?usp=sharing).
+Trained model is available [here](https://drive.google.com/drive/folders/1q8pjmHDfSUTna13F2R_gU3P-FYCjEP7A?usp=sharing).
 
 ## Training
 Please note, some details are changed from the original paper for more efficient training. 
