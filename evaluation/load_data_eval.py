@@ -37,9 +37,11 @@ class SketchPoseDataset(data.Dataset):
         self.n_pts = n_pts
         self.img_size = img_size
         if FLAGS.eval_refine_mug:
-            self.detection_dir = os.path.join(data_dir, 'detection_dualposenet/data/segmentation_results_refine_for_mug')
+            # self.detection_dir = os.path.join(data_dir, 'detection_dualposenet/data/segmentation_results_refine_for_mug')
+            self.detection_dir = '/data1/zrd/datasets1/segmentation_results_refine_for_mug'
         else:
-            self.detection_dir = os.path.join(data_dir, 'detection_dualposenet/data/segmentation_results')
+            # self.detection_dir = os.path.join(data_dir, 'detection_dualposenet/data/segmentation_results')
+            self.detection_dir = '/data1/zrd/datasets1/segmentation_results'
 
         assert source in ['CAMERA', 'Real', 'CAMERA+Real']
         assert mode in ['train', 'test']
@@ -47,35 +49,24 @@ class SketchPoseDataset(data.Dataset):
                          'CAMERA/val_list.txt', 'Real/test_list.txt']
         model_file_path = ['obj_models/camera_train.pkl', 'obj_models/real_train.pkl',
                            'obj_models/camera_val.pkl', 'obj_models/real_test.pkl']
-        occupancy_resolution = 16
-        self.resolution = occupancy_resolution
-        model_occupancy_file_path = [f'obj_models/camera_train_occupancy_res{occupancy_resolution}.pkl',
-                                     f'obj_models/real_train_occupancy_res{occupancy_resolution}.pkl',
-                                     f'obj_models/camera_val_occupancy_res{occupancy_resolution}.pkl',
-                                     f'obj_models/real_test_occupancy_res{occupancy_resolution}.pkl']
 
         if mode == 'train':
             del img_list_path[2:]
             del model_file_path[2:]
-            del model_occupancy_file_path[2:]
         else:
             del img_list_path[:2]
             del model_file_path[:2]
-            del model_occupancy_file_path[:2]
         if source == 'CAMERA':
             del img_list_path[-1]
             del model_file_path[-1]
-            del model_occupancy_file_path[-1]
         elif source == 'Real':
             del img_list_path[0]
             del model_file_path[0]
-            del model_occupancy_file_path[0]
         else:
             # only use Real to test when source is CAMERA+Real
             if mode == 'test':
                 del img_list_path[0]
                 del model_file_path[0]
-                del model_occupancy_file_path[0]
 
         img_list = []
         subset_len = []
@@ -154,12 +145,6 @@ class SketchPoseDataset(data.Dataset):
             with open(os.path.join(data_dir, path), 'rb') as f:
                 models.update(cPickle.load(f))
         self.models = models
-
-        models_occupancy = {}
-        for path in model_occupancy_file_path:
-            with open(os.path.join(data_dir, path), 'rb') as f:
-                models_occupancy.update(cPickle.load(f))
-        self.models_occupancy = models_occupancy
 
         # move the center to the body of the mug
         # meta info for re-label mug category
@@ -300,7 +285,6 @@ class SketchPoseDataset(data.Dataset):
             depth_v_value = roi_depth[roi_m_d_valid]
             depth_normalize = (roi_depth - np.min(depth_v_value)) / (np.max(depth_v_value) - np.min(depth_v_value))
             depth_normalize[~roi_m_d_valid] = 0.0
-            # occupancy canonical
             # sym
             sym_info = self.get_sym_info(self.id2cat_name[str(cat_id)])
             mean_shape = self.get_mean_shape(self.id2cat_name[str(cat_id)])
@@ -578,7 +562,6 @@ if __name__ == '__main__':
             s_d_map_n, camK = data[3].to(device), data[4].to(device)
             obj_mask, obj_id = data[5].to(device), data[6].to(device)
             R, T, s = data[7].to(device), data[8].to(device), data[9].to(device)
-            occupancy, sym = data[10].to(device), data[11].to(device)
             grid, sketch = data[12].to(device).numpy(), data[13].to(device).numpy()
             grid = grid.transpose(1, 2, 0) * 16
             sketch[sketch != 0] = 200

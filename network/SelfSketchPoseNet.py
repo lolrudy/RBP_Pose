@@ -6,7 +6,6 @@ FLAGS = flags.FLAGS
 
 from network.fs_net_repo.PoseNet9D import PoseNet9D
 from network.point_sample.face_sample import Sketch2Pc
-from network.backbone_repo.Resnet.Backbone_resnet import GNS
 from datasets.data_augmentation import defor_3D_pc, defor_3D_bb, defor_3D_rt, defor_3D_bc, deform_non_linear
 from losses.fs_net_loss import fs_net_loss
 from losses.recon_loss import recon_6face_loss
